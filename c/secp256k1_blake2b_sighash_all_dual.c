@@ -24,6 +24,7 @@
 #define PUBKEY_SIZE 33
 #define RECID_INDEX 64
 #define SIGNATURE_SIZE 65
+#define MAX_PUBKEYS 10
 /* 32 KB */
 #define MAX_WITNESS_SIZE 32768
 #define SCRIPT_SIZE 32768
@@ -128,10 +129,14 @@ __attribute__((visibility("default"))) int validate_signature(
 // script code. It could be a different script code using this script via as a
 // library.
 __attribute__((visibility("default"))) int
-validate_secp256k1_blake2b_sighash_all(uint8_t *output_public_key_hash) {
+validate_secp256k1_blake2b_sighash_all(uint8_t *output_public_key_hash, size_t pubkey_cnt) {
   unsigned char temp[TEMP_SIZE];
-  unsigned char lock_bytes[SIGNATURE_SIZE];
+  unsigned char lock_bytes[SIGNATURE_SIZE * MAX_PUBKEYS];
   uint64_t len = 0;
+
+  if (pubkey_cnt > MAX_PUBKEYS) {
+    return ERROR_ARGUMENTS_LEN;
+  }
 
   // Load witness of first input
   uint64_t witness_len = MAX_WITNESS_SIZE;
@@ -228,30 +233,32 @@ validate_secp256k1_blake2b_sighash_all(uint8_t *output_public_key_hash) {
     return ret;
   }
 
-  secp256k1_ecdsa_recoverable_signature signature;
-  if (secp256k1_ecdsa_recoverable_signature_parse_compact(
-          &context, &signature, lock_bytes, lock_bytes[RECID_INDEX]) == 0) {
-    return ERROR_SECP_PARSE_SIGNATURE;
+  for(int i = 0; i < pubkey_cnt; i++) {
+    secp256k1_ecdsa_recoverable_signature signature;
+    if (secp256k1_ecdsa_recoverable_signature_parse_compact(
+            &context, &signature, lock_bytes + i * SIGNATURE_SIZE, lock_bytes[i * SIGNATURE_SIZE + RECID_INDEX]) == 0) {
+      return ERROR_SECP_PARSE_SIGNATURE;
+    }
+
+    // Recover pubkey
+    secp256k1_pubkey pubkey;
+    if (secp256k1_ecdsa_recover(&context, &pubkey, &signature, message) != 1) {
+      return ERROR_SECP_RECOVER_PUBKEY;
+    }
+
+    // Check pubkey hash
+    size_t pubkey_size = PUBKEY_SIZE;
+    if (secp256k1_ec_pubkey_serialize(&context, temp, &pubkey_size, &pubkey,
+                                      SECP256K1_EC_COMPRESSED) != 1) {
+      return ERROR_SECP_SERIALIZE_PUBKEY;
+    }
+
+    blake2b_init(&blake2b_ctx, BLAKE2B_BLOCK_SIZE);
+    blake2b_update(&blake2b_ctx, temp, pubkey_size);
+    blake2b_final(&blake2b_ctx, temp, BLAKE2B_BLOCK_SIZE);
+
+    memcpy(output_public_key_hash + i * BLAKE160_SIZE, temp, BLAKE160_SIZE);
   }
-
-  // Recover pubkey
-  secp256k1_pubkey pubkey;
-  if (secp256k1_ecdsa_recover(&context, &pubkey, &signature, message) != 1) {
-    return ERROR_SECP_RECOVER_PUBKEY;
-  }
-
-  // Check pubkey hash
-  size_t pubkey_size = PUBKEY_SIZE;
-  if (secp256k1_ec_pubkey_serialize(&context, temp, &pubkey_size, &pubkey,
-                                    SECP256K1_EC_COMPRESSED) != 1) {
-    return ERROR_SECP_SERIALIZE_PUBKEY;
-  }
-
-  blake2b_init(&blake2b_ctx, BLAKE2B_BLOCK_SIZE);
-  blake2b_update(&blake2b_ctx, temp, pubkey_size);
-  blake2b_final(&blake2b_ctx, temp, BLAKE2B_BLOCK_SIZE);
-
-  memcpy(output_public_key_hash, temp, BLAKE160_SIZE);
 
   return CKB_SUCCESS;
 }
@@ -295,7 +302,7 @@ __attribute__((visibility("default"))) int validate_simple() {
   }
 
   uint8_t public_key_hash[BLAKE160_SIZE];
-  ret = validate_secp256k1_blake2b_sighash_all(public_key_hash);
+  ret = validate_secp256k1_blake2b_sighash_all(public_key_hash, 1);
   if (ret != CKB_SUCCESS) {
     return ret;
   }
